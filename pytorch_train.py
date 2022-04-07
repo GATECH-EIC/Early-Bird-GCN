@@ -1,0 +1,153 @@
+import os.path as osp
+import argparse
+
+import torch
+import torch.nn.functional as F
+import torch_geometric.utils.num_nodes as geo_num_nodes
+from torch_geometric.datasets import Planetoid
+import torch_geometric.transforms as T
+from torch_geometric.nn import GCNConv, DataParallel
+from utils import *
+import numpy as np
+from torch_geometric.utils import dense_to_sparse
+import torch.utils.checkpoint as checkpoint
+
+only_cpu = 1
+if(only_cpu==1):
+    device = torch.device('cpu')
+    print("using cpu... ")
+else:
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print("using gpu... ")
+
+#
+# Differentiable conversion from edge_index/edge_attr to adj
+def edge_to_adj(edge_index, edge_attr=None,num_nodes=None):
+    row, col = edge_index
+
+    if edge_attr is None:
+        edge_attr = torch.ones(row.size(0))
+    else:
+        edge_attr = edge_attr.view(-1)
+        assert edge_attr.size(0) == row.size(0)
+    n_nodes = geo_num_nodes.maybe_num_nodes(edge_index, num_nodes)
+    diff_adj = torch.zeros([n_nodes,n_nodes])
+    diff_adj += torch.eye(diff_adj.shape[0])
+    diff_adj[row,col] = edge_attr
+    return diff_adj
+
+def adj_to_edge(adj:torch.Tensor):
+    new_adj = adj - torch.eye(adj.shape[0]).to(device)
+    edge_index = (new_adj > 0).nonzero(as_tuple=False).t()
+    row,col = edge_index
+    edge_weight = new_adj[row,col].float()
+    return (edge_index.to(device),edge_weight.to(device))
+
+class DummyLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+    def forward(self,x):
+        return x + self.dummy - self.dummy #(also tried x+self.dummy)
+
+class Net(torch.nn.Module): 
+    def __init__(self, dataset, data, args, adj=()):
+        super(Net, self).__init__()
+        self.data = data
+        self.conv1 = GCNConv(dataset.num_features, 16,
+                             normalize=not args.use_gdc)
+        self.conv2 = GCNConv(16, dataset.num_classes,
+                             normalize=not args.use_gdc)
+        self.dummy = torch.ones(1, dtype=torch.float32, requires_grad=True)
+        # print(adj)
+        if len(adj) == 0:
+            self.adj1 = edge_to_adj(data.edge_index,data.edge_attr,data.num_nodes).to(device)
+        else:
+            self.adj1 = torch.from_numpy(adj).to(device)
+        # self.adj1 = torch.eye(data.num_nodes)
+        self.adj2 = self.adj1.clone().to(device)
+        # self.conv1 = ChebConv(data.num_features, 16, K=2)
+        # self.conv2 = ChebConv(16, data.num_features, K=2)
+    
+    def checkpoint1(self, module):
+        def forward1(*inputs):
+            return module(inputs[0], self.ei1, self.ew1)
+        return forward1
+    
+    def checkpoint3(self):
+        def forward3(*inputs):
+            return F.relu(inputs[0])
+        return forward3
+    def checkpoint2(self, module):
+        def forward2(*inputs):
+            return module(inputs[0], self.ei2, self.ew2)
+        return forward2
+
+    def forward(self):
+        x, edge_index, edge_weight = self.data.x, self.data.edge_index, self.data.edge_attr
+        self.ei1, self.ew1 = adj_to_edge(self.adj1)
+        self.ei2, self.ew2 = adj_to_edge(self.adj2)
+        x = checkpoint.checkpoint(self.checkpoint1(self.conv1),x, self.dummy)
+        x = checkpoint.checkpoint(self.checkpoint3(),x,self.dummy)
+        x = F.dropout(x, training=self.training)
+        x = checkpoint.checkpoint(self.checkpoint2(self.conv2),x, self.dummy)
+        return F.log_softmax(x, dim=1)
+
+def train(model,data):
+    model.train()
+    optimizer.zero_grad()
+
+    F.nll_loss(model()[data.train_mask], data.y[data.train_mask]).backward()
+    optimizer.step()
+
+
+@torch.no_grad()
+def test(model, data):
+    model.eval()
+    logits, accs = model(), []
+    masks = ['train_mask', 'val_mask', 'test_mask']
+    for i,(_, mask) in enumerate(data('train_mask', 'val_mask', 'test_mask')):
+        pred = logits[mask].max(1)[1]
+        acc = pred.eq(data.y[mask]).sum().item() / mask.sum().item()
+        accs.append(acc)
+    return accs
+
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--use_gdc', type=bool, default=False)
+    parser.add_argument("--dataset", type=str, default="Cora")
+    args = parser.parse_args()
+
+    dataset = args.dataset
+    # print("pytorch_train dataset: ",dataset)
+
+    path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'data', dataset)
+    dataset = Planetoid(path, dataset, transform=T.NormalizeFeatures())
+    # print(len(dataset))
+    data = dataset[0]    
+    model, data = Net(dataset, data, args), data.to(device)
+    model = model.to(device)
+    for param in model.conv1.parameters():
+        param.requires_grad = True
+    for param in model.conv2.parameters():
+        param.requires_grad = True        
+    optimizer = torch.optim.Adam([
+        dict(params=model.conv1.parameters(), weight_decay=5e-4),
+        dict(params=model.conv2.parameters(), weight_decay=0)
+    ], lr=0.01)  # Only perform weight-decay on first convolution.
+    best_val_acc = test_acc = 0
+    for epoch in range(1, args.epochs):
+        train(model,data)
+        train_acc, val_acc, tmp_test_acc = test(model, data)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            test_acc = tmp_test_acc
+        log = 'Pretrain Epoch: {:03d}, Train: {:.4f}, Val: {:.4f}, Test: {:.4f}'
+        # print(log.format(epoch, train_acc, best_val_acc, test_acc))
+    # print(model.state_dict().keys())
+    # print('pretrain Epochs: ',args.epochs)
+    torch.save(model.state_dict(), f"./pretrain_pytorch/{args.dataset}_model.pth.tar")
