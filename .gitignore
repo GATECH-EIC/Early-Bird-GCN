@@ -3,3 +3,6 @@
 
 # Idea Proj
 .idea
+
+# gcn data
+gcn/data/*
